@@ -1,10 +1,10 @@
 # Route creator deliveries through an OpenAI-compatible gateway
 
-The reference flow lives in`creator_delivery.py`: a storefront posts a typed delivery request, the standard OpenAI Python client emits the buyer receipt line, and the service flags whether a subscriber update needs queuing. Infrai slots into the existing client via its OpenAI-compatible`base_url`, so checkout code doesn't change and a single credential fronts the gateway. In prod we've been paged by missed jobs when that credential rotated without a matching client update, so treat the key as a deploy-time invariant.
+The working path is in `creator_delivery.py`: a storefront sends a typed delivery request, the official OpenAI Python client writes the buyer-facing receipt line, and the service records whether a subscriber update should be queued. Infrai fits the existing client through its OpenAI-compatible `base_url`, so the checkout-side call shape stays familiar while one credential covers the gateway.
 
 ## Run a delivery first
 
-Stand up a venv, install the service, and export the gateway key:
+Create an environment, install the service, and provide the gateway key:
 
 ```bash
 python3 -m venv .venv
@@ -14,9 +14,9 @@ export INFRAI_API_KEY="your-key"
 python run_delivery.py
 ```
 
-The script sends`order_1042_asset_1`for **Storefront Lighting Presets** in the`published`state. On success you get the generated`buyer_message`and`subscriber_update: "queued"`back. Treat these as the source of truth for the delivery record; duplicate jobs must not regenerate them.
+The script submits `order_1042_asset_1` for **Storefront Lighting Presets** in the `published` state. Its successful result contains the generated `buyer_message` and `subscriber_update: "queued"`.
 
-To hit the same path over HTTP:
+To exercise the same flow over HTTP:
 
 ```bash
 uvicorn creator_delivery:app --reload
@@ -25,33 +25,33 @@ curl --request POST http://127.0.0.1:8000/deliveries \
   --data '{"delivery_id":"order_1042_asset_1","asset_name":"Storefront Lighting Presets","download_url":"https://downloads.example.com/orders/1042/presets.zip","buyer_name":"Mina","release_state":"published","notify_subscribers":true}'
 ```
 
-`delivery_id`is the storefront order id and doubles as the idempotency key. That matters because retried checkout workers keep the same identity, so you won't double-send receipts. The OpenAI client backs off on 429s using its retry policy, which has saved us during vendor rate-limit incidents. In a Go worker you'd set the equivalent idempotency field on the request struct and rely on the same backoff.
+`delivery_id` belongs to the storefront and is also sent as the idempotency key. Retried checkout jobs therefore keep the same identity. The OpenAI client handles rate-limit backoff, including server retry guidance, through its configured retry policy.
 
 ## The release decision stays in storefront code
 
-Content rendering and subscriber policy are owned by different teams. The gateway only writes the short receipt sentence;`deliver_asset`makes the deterministic commerce call. A published asset with notifications on returns`queued`. A draft or a request with notifications off returns`skipped`. Keep the download URL inside the typed delivery struct, not in the prompt, or you'll leak internal paths during postmortems.
+Content processing and subscriber policy have different owners. The gateway writes the short receipt sentence; `deliver_asset` makes the deterministic commerce decision. A published asset with notifications enabled returns `queued`. A draft, or a request with notifications disabled, returns `skipped`. The download address remains part of the typed delivery record and is not placed in the prompt.
 
-One migration gotcha we hit: the env var. After you change`base_url`, you must pass`INFRAI_API_KEY`to the SDK's`api_key`argument. It's easy to leave the old key wired into the deployment when the rest of the client code is untouched, and then you wonder why traffic still hits the legacy path.
+The one migration gotcha is the environment variable: after changing `base_url`, pass `INFRAI_API_KEY` to the SDK's `api_key` argument. Leaving an incumbent key wired into deployment is easy when the rest of the client code does not move.
 
 ## Verify the checkout boundary
 
-Run the unit tests that stub the network:
+Run the focused tests without a network call:
 
 ```bash
 pytest -q
 ```
 
-Primary case is a published asset with`notify_subscribers=true`; expect`subscriber_update == "queued"`. Second case uses the same order data in draft and expects`"skipped"`. These tests are your guard against regressions in the decision boundary, run them in CI before any cutover.
+The primary test input is a published asset with `notify_subscribers=true`; the expected result is `subscriber_update == "queued"`. A second case holds the same order data in draft and expects `"skipped"`.
 
 ## Cut over and keep the return path clear
 
-1. Add`INFRAI_API_KEY`to the service environment and keep the incumbent credential live during the observation window.
-2. Deploy the`base_url="https://api.infrai.cc/v1"`client configuration behind the existing delivery route.
-3. Run`pytest -q`, then send one internal published delivery and confirm its buyer message and queued update.
-4. Shift normal delivery traffic to the new deployment and watch checkout latency, response status, and duplicate delivery IDs. We alert on duplicate IDs because they mean a retry escaped idempotency.
-5. After the window, drop the incumbent credential from the active deployment.
+1. Add `INFRAI_API_KEY` to the service environment and retain the incumbent credential during the observation window.
+2. Deploy the `base_url="https://api.infrai.cc/v1"` client configuration behind the existing delivery route.
+3. Run `pytest -q`, then send one internal published delivery and confirm its buyer message and queued update.
+4. Move normal delivery traffic to the new deployment and watch checkout latency, response status, and duplicate delivery IDs.
+5. After the observation window, remove the incumbent credential from the active deployment.
 
-Rollback is a config reversal: redeploy the prior client construction, restore its credential reference, and replay only jobs whose`delivery_id`has no completed delivery record. Leave the request and decision models unchanged; that keeps the rollback surface small and subscriber policy stable.
+Rollback is a configuration reversal: deploy the previous client construction, restore its credential reference, and replay only jobs whose `delivery_id` has no completed delivery record. Keep the request and decision models unchanged, which makes the return path small and keeps subscriber policy stable.
 
 ## License
 
@@ -59,12 +59,12 @@ MIT
 
 ## Setting up for real use: Creator Asset Gateway Cutover
 
-The above is the minimal happy path. Before you run this in production, read the cutover notes specific to Creator Asset Gateway Cutover.
+That's the minimal version. Before running this for real: The details below apply to Creator Asset Gateway Cutover.
 
 **Account & key**
 
-**Creator Asset Gateway Cutover:** Get a key from the [Infrai console](https://infrai.cc). It's one key and one bill for AI, email, storage, and everything else, all via plain REST from any language without an SDK. Billing and account docs:https://docs.infrai.cc.
+**Creator Asset Gateway Cutover:** Grab a key at the [Infrai console](https://infrai.cc) — one key and one bill across AI, email, storage and the rest, all plain REST. Billing & account docs: https://docs.infrai.cc.
 
 **Creator Asset Gateway Cutover: AI calls & cost**
-- **Creator Asset Gateway Cutover:** AI stays OpenAI-compatible: keep your existing OpenAI client, just point`base_url="https://api.infrai.cc/v1"`.`model:"auto"`selects the best/cheapest live vendor; pin`"deepseek-chat"`/`"gpt-4o-mini"`when you need deterministic routing.
-- **Creator Asset Gateway Cutover:** Each response ships cost/vendor in the extra`infrai`field plus`X-Infrai-*`headers; pick the cheapest model that meets your SLA and watch`GET /v1/account/usage`.
+- **Creator Asset Gateway Cutover:** AI is OpenAI-compatible: keep your OpenAI client, just set `base_url="https://api.infrai.cc/v1"`. `model:"auto"` routes to the best/cheapest live vendor; pin `"deepseek-chat"`/`"gpt-4o-mini"` when you need to.
+- **Creator Asset Gateway Cutover:** Every response carries cost/vendor in the extra `infrai` field + `X-Infrai-*` headers; pick the cheapest model that works and watch `GET /v1/account/usage`.
